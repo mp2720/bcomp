@@ -31,9 +31,9 @@ def scan(img: Image.Image, out_file):
         if glyph not in interpr:
             print(glyph)
             char = input(
-                'Что это за символ? (если оставить пустым, то будет игнорироваться): '
+                'Что это за символ? '
             ).strip()
-            assert char
+            assert char, 'введена пустая строка'
             interpr[glyph] = char
 
         return interpr[glyph]
@@ -53,8 +53,8 @@ def scan(img: Image.Image, out_file):
         plus = process_word(x + 39, y, 1)
         data = process_word(x + 56, y, 4)
 
-        assert (addr is None) == \
-            (data is None), "в непустой строке должены быть адрес и данные"
+        assert bool(addr) == \
+            bool(data), "в непустой строке должены быть адрес и данные"
 
         if addr is None or data is None:
             return
