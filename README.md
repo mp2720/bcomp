@@ -11,6 +11,12 @@ Folder "docs" is for old model and would be deleted in the future for v2.
 
 ## ЛР 2, 3
 
+Для работы `ocr.py` надо установить `PIL`:
+
+```bash
+pip install pillow
+```
+
 Программа даётся в виде картинки с машинным кодом. Для считывания текста нужно выполнить команду
 ```bash
 ./ocr.py VARIANT.png OUTPUT_TEXT 
