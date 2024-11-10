@@ -5,8 +5,10 @@ import sys
 import re
 
 from dataclasses import dataclass
+from bisect import bisect_left
 from typing import cast
 from enum import Enum
+from copy import copy
 
 
 @dataclass
@@ -234,13 +236,18 @@ def disas_instr(cur_addr: int, word: int) -> tuple[Instr, int | None]:
 
 
 def dump_prog(
-    start_addr: int,
-    instrs: list[Instr],
-    used_addrs: dict[int, int],
+    addrs_and_instrs: list[tuple[int, Instr]],
+    accessed_addrs: list[int],
     show_addrs_for_instrs=False,
     show_instr_bin_repr=False,
     russian=False
 ) -> str:
+    lines = []
+    last_addr = -2
+    label_cnt = 0
+    addrs_and_instrs_copy = copy(addrs_and_instrs)
+    accessed_addrs_copy = copy(accessed_addrs)
+
     EN_TO_RU = {
         'AND': 'И',
         'OR': 'ИЛИ',
@@ -307,24 +314,30 @@ def dump_prog(
         else:
             return keyword
 
-    lines = []
-
     def place_org(addr: int):
         if addr is not None:
             lines.append(f'            {trans("ORG"):12}  0x{addr:03x}')
 
-    def place_label(cnt: int, org: int | None = None):
-        nonlocal lines
+    def place_label(cnt: int, addr: int):
+        nonlocal lines, last_addr
 
         if len(lines) != 0:
             lines.append('')
 
-        if org is not None:
-            place_org(org)
+        if last_addr + 1 != addr:
+            place_org(addr)
 
         lines.append(f'{trans("label")}{cnt}:')
 
-    def addr_opnd_to_str(instr: AddrOrImmInstr):
+        last_addr = addr - 1
+
+    def addr_or_imm_opnd_to_str(instr: AddrOrImmInstr, instr_addr: int) -> str:
+        def ip_rel_to_str(addr):
+            if addr < instr_addr:
+                return f'IP-{instr_addr - addr}'
+            else:
+                return f'IP+{addr - instr_addr}'
+
         match instr.mode:
             case AddrOrImmInstr.Mode.IMMEDIATE:
                 return f' #0x{instr.opnd:02x}'
@@ -333,42 +346,47 @@ def dump_prog(
                 return f' ({trans("SP")}+{instr.opnd})'
 
             case _:
-                fmt = {
-                    AddrOrImmInstr.Mode.ABSOLUTE_DIRECT: ' $%s',
-                    AddrOrImmInstr.Mode.IP_RELATIVE_DIRECT: '  %s',
-                    AddrOrImmInstr.Mode.IP_RELATIVE_INDIRECT: ' (%s)',
-                    AddrOrImmInstr.Mode.IP_RELATIVE_INDIRECT_INC: ' (%s)+',
-                    AddrOrImmInstr.Mode.IP_RELATIVE_INDIRECT_DEC: '-(%s)',
-                }[instr.mode]
+                i = bisect_left(accessed_addrs, instr.opnd)
+                assert accessed_addrs[i] == instr.opnd
+                opnd_str = f'{trans("label")}{i}'
 
-                if instr.opnd in used_addrs:
-                    opnd_str = f'{trans("label")}{used_addrs[instr.opnd]}'
-                else:
-                    opnd_str = f'0x{instr.opnd:03x}'
+                ip_rel = ip_rel_to_str(instr.opnd)
 
-                return fmt % opnd_str
+                match instr.mode:
+                    case AddrOrImmInstr.Mode.ABSOLUTE_DIRECT:
+                        opnd_str = f' ${opnd_str}'
+                        comm = ''
+                    case AddrOrImmInstr.Mode.IP_RELATIVE_DIRECT:
+                        opnd_str = f'  {opnd_str}'
+                        comm = f';   {ip_rel}'
+                        # return f'  {opnd_str:8}   ; {rel_str}'
+                    case AddrOrImmInstr.Mode.IP_RELATIVE_INDIRECT:
+                        opnd_str = f' ({opnd_str})'
+                        comm = f';  ({ip_rel})'
+                        # return f' ({opnd_str}:8)   ; ({rel_str})'
+                    case AddrOrImmInstr.Mode.IP_RELATIVE_INDIRECT_INC:
+                        opnd_str = f' ({opnd_str})+'
+                        comm = f';  ({ip_rel})+'
+                        # return f' ({opnd_str})+ ; ({rel_str})+'
+                    case AddrOrImmInstr.Mode.IP_RELATIVE_INDIRECT_DEC:
+                        opnd_str = f'-({opnd_str})'
+                        comm = f'; -({ip_rel})'
 
-    for addr, cnt in sorted(used_addrs.items()):
-        # Метки, адреса которых находятся за пределами программы нужно как-то объявить.
-        # Для этого можно использовать конструкцию вида:
-        #
-        #    ORG 0xHHH
-        # label:
-        if addr not in range(start_addr, start_addr + len(instrs)):
-            place_label(cnt, addr)
+                if not comm:
+                    return opnd_str
 
-    lines.append('')
-    place_org(start_addr)
-    lines.append('')
+                return f'{opnd_str:16}{comm}'
 
-    cur_addr = start_addr
-    for instr in instrs:
-        if cur_addr in used_addrs:
-            place_label(used_addrs[cur_addr])
+    def place_instr(instr: Instr, addr: int):
+        nonlocal last_addr
+
+        if last_addr + 1 != addr:
+            place_org(addr)
+            lines.append('')
 
         line = ''
         if show_addrs_for_instrs:
-            line += f'{cur_addr:03x}:'
+            line += f'{addr:03x}:'
         else:
             line += ' ' * 4
 
@@ -393,10 +411,34 @@ def dump_prog(
                     case IOInstr():
                         line += f'  0x{instr.opnd:02x}'
                     case AddrOrImmInstr():
-                        line += addr_opnd_to_str(instr)
+                        line += addr_or_imm_opnd_to_str(instr, instr_addr)
 
         lines.append(line)
-        cur_addr += 1
+        last_addr = addr
+
+    def place_labels(until_addr: int):
+        nonlocal label_cnt
+
+        while accessed_addrs_copy:
+            if accessed_addrs_copy[0] > until_addr:
+                break
+
+            place_label(label_cnt, accessed_addrs_copy[0])
+            label_cnt += 1
+
+            del accessed_addrs_copy[0]
+
+    while addrs_and_instrs_copy:
+        instr_addr, instr = addrs_and_instrs_copy[0]
+
+        place_labels(instr_addr)
+
+        place_instr(instr, instr_addr)
+
+        del addrs_and_instrs_copy[0]
+
+    # все оставшиеся
+    place_labels(2**11)
 
     return '\n'.join(lines)
 
@@ -412,14 +454,17 @@ if __name__ == "__main__":
         default=None
     )
     parser.add_argument(
-        '-x', '--hex',
-        help='Считывать программу в формате набора шестнадцатиричных цифр, которые могут быть '
-        'разделены пробельными символами. По умолчанию программа считывается в бинарном виде',
-        action='store_true'
+        '-f', '--input-format',
+        help='По умолчанию bin - программа в бинарном виде, hex - набор шестнадцатиричных цифр, '
+        'которые могут быть разделены пробельными символами, lab - в формате варианта лабораторной '
+        'РАБоты',
+        nargs='?',
+        default='bin'
     )
     parser.add_argument(
         '-o', '--org',
-        help='Адрес, который в памяти БЭВМ имеет первое слово входных данных. По умолчанию 0x10',
+        help='Адрес, который в памяти БЭВМ имеет первое слово входных данных. По умолчанию 0x10. '
+        'Не учитывается если --input-format lab',
     )
     parser.add_argument(
         '-a', '--addr',
@@ -438,36 +483,6 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Выбрать нужный файл
-    if args.filepath is not None:
-        file = open(args.filepath, 'r' + ('' if args.hex else 'b'))
-    else:
-        if args.hex:
-            file = sys.stdin
-        else:
-            file = sys.stdin.buffer
-
-    # Считать программу
-    if args.hex:
-        text = cast(str, file.read())
-        text = re.sub(r'\s', '', text)
-
-        if len(text) & 1:
-            raise ValueError(
-                "Количество шестнадцатеричных цифр должно быть чётным")
-
-        data = bytearray.fromhex(text)
-    else:
-        data = cast(bytes, file.read())
-
-    if len(data) & 1:
-        raise ValueError(
-            "Количество байтов должно быть чётно - БЭВМ работает с 16-битными словами"
-        )
-
-    if len(data) == 0:
-        raise ValueError("На вход дана пустая программа")
-
     # Выбрать начальный адрес
     if args.org is not None:
         if args.org.startswith('0x'):
@@ -477,26 +492,94 @@ if __name__ == "__main__":
     else:
         start_addr = 0x10
 
+    # Выбрать нужный файл
+    if args.filepath is not None:
+        file = open(
+            args.filepath,
+            'r' + ('b' if args.input_format == 'bin' else '')
+        )
+    else:
+        if args.input_format == 'bin':
+            file = sys.stdin.buffer
+        else:
+            file = sys.stdin
+
+    instrs_addrs: list[int] | range
+    fast_used_addrs: set[int] | range
+
+    # Считать в нужном формате
+    match args.input_format:
+        case 'bin':
+            data = cast(bytes, file.read())
+            instrs_addrs = range(start_addr, start_addr + len(data) // 2)
+        case 'hex':
+            text = cast(str, file.read())
+            text = re.sub(r'\s', '', text)
+
+            if len(text) & 1:
+                raise ValueError(
+                    "Количество шестнадцатеричных цифр должно быть чётным"
+                )
+
+            data = bytearray.fromhex(text)
+            instrs_addrs = range(start_addr, start_addr + len(data) // 2)
+        case 'lab':
+            LINE_RE = re.compile(r'^([0-9a-fA-F]+)\s*:\s*([0-9a-fA-F]+)$')
+
+            instrs_addrs = []
+            instrs_addrs_set = set()
+            data = bytearray()
+
+            for i, line in enumerate(cast(str, file.read()).split('\n')):
+                line = line.strip()
+                if not line:
+                    continue
+
+                m = LINE_RE.match(line)
+                if m is None:
+                    raise ValueError(f'invalid line {i + 1}')
+
+                addr = int(m.group(1), 16)
+                instr = int(m.group(2), 16)
+
+                if addr in instrs_addrs_set:
+                    raise ValueError(
+                        f'В строке {i + 1} адрес {hex(addr)} используется второй раз'
+                    )
+
+                instrs_addrs.append(addr)
+                instrs_addrs_set.add(addr)
+
+                data.append(instr // 256)
+                data.append(instr % 256)
+        case _:
+            print(f'Неизвестный формат {args.input_format}', file=sys.stderr)
+            exit(1)
+
+    if len(data) & 1:
+        raise ValueError(
+            "Количество байтов должно быть чётно - БЭВМ работает с 16-битными словами"
+        )
+
+    if len(data) == 0:
+        raise ValueError("На вход дана пустая программа")
+
     # Дизассемблировать инструкции
-    instrs = []
-    used_addrs: dict[int, int] = {}
-    cur_addr = start_addr
-    for i in range(0, len(data), 2):
-        word_bytes = data[i:i + 2]
+    addrs_and_instrs: list[tuple[int, Instr]] = []
+    accessed_addrs: set[int] = set()
+    for i in range(0, len(data) // 2):
+        word_bytes = data[i * 2:(i + 1) * 2]
         word = word_bytes[0] * 256 + word_bytes[1]
 
-        instr, used_addr = disas_instr(cur_addr, word)
-        instrs.append(instr)
-        if used_addr is not None and used_addr not in used_addrs:
-            used_addrs[used_addr] = len(used_addrs) + 1
-
-        cur_addr += 1
+        instr, accessed_addr = disas_instr(instrs_addrs[i], word)
+        addrs_and_instrs.append((instrs_addrs[i], instr))
+        if accessed_addr is not None:
+            accessed_addrs.add(accessed_addr)
 
     # Вывести программу
     print(dump_prog(
-        start_addr,
-        instrs,
-        used_addrs,
+        sorted(addrs_and_instrs),
+        sorted(accessed_addrs),
         show_addrs_for_instrs=args.addr,
         show_instr_bin_repr=args.bin,
         russian=args.ru

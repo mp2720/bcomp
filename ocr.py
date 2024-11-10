@@ -50,7 +50,6 @@ def scan(img: Image.Image, out_file):
 
     def process_row(x: int, y: int):
         addr = process_word(x, y, 3)
-        plus = process_word(x + 39, y, 1)
         data = process_word(x + 56, y, 4)
 
         assert bool(addr) == \
@@ -60,7 +59,7 @@ def scan(img: Image.Image, out_file):
             return
 
         print(
-            addr + ':' + (' ' + plus if plus else '') + ' ' + data,
+            addr + ': ' + data,
             file=out_file
         )
 
